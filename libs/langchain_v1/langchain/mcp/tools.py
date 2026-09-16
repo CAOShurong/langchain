@@ -31,6 +31,7 @@ from mcp.types import (
     TextContent,
     TextResourceContents,
 )
+from typing_extensions import NotRequired
 
 from langchain.mcp.elicitation import _call_tool_with_interrupts, _drives_interrupts
 
@@ -49,6 +50,7 @@ class _ToolCallResult(Protocol):
 
     content: list[ContentBlock]
     structured_content: dict[str, Any] | None
+    meta: dict[str, Any] | None
     is_error: bool
 
 
@@ -62,11 +64,21 @@ class MCPToolArtifact(TypedDict):
     Wrapping the structured content in a `TypedDict` leaves room for further
     MCP result fields without changing the artifact's shape.
 
+    Both fields are populated independently and only when the server actually
+    sent the corresponding data on this response; a field absent from the
+    server's response is omitted entirely (not `None`). `_convert_call_tool_result`
+    returns `None` instead of an artifact when neither is present.
+
     Attributes:
         structured_content: The `structuredContent` of the MCP tool result.
+        meta: The result-level `_meta` object from the `CallToolResult`, if the
+            server attached one. This is per-response metadata and is distinct
+            from a tool's static `_meta`, which surfaces via the LangChain tool's
+            own `metadata` attribute.
     """
 
-    structured_content: Any
+    structured_content: NotRequired[Any]
+    meta: NotRequired[dict[str, Any]]
 
 
 def _summarize_tool_error(tool_content: list[ToolMessageContentBlock]) -> str:
@@ -175,8 +187,13 @@ def _convert_call_tool_result(
         raise _MCPToolExecutionError(tool_content)
 
     artifact: MCPToolArtifact | None = None
-    if result.structured_content is not None:
-        artifact = MCPToolArtifact(structured_content=result.structured_content)
+    result_meta = getattr(result, "meta", None)
+    if result.structured_content is not None or result_meta is not None:
+        artifact = {}
+        if result.structured_content is not None:
+            artifact["structured_content"] = result.structured_content
+        if result_meta is not None:
+            artifact["meta"] = result_meta
     return tool_content, artifact
 
 

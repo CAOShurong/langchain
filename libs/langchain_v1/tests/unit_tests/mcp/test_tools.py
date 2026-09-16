@@ -80,7 +80,9 @@ async def test_text_result_becomes_content_blocks_and_structured_artifact() -> N
     )
 
     assert _blocks_without_ids(message.content) == [{"type": "text", "text": "3"}]
-    assert message.artifact == {"structured_content": {"result": 3}}
+    assert message.artifact is not None
+    assert message.artifact["structured_content"] == {"result": 3}
+    assert "meta" in message.artifact
     assert message.status == "success"
 
 
@@ -130,7 +132,7 @@ async def test_client_failure_raises_instead_of_becoming_tool_output(
         await tool.ainvoke({"name": "ping", "args": {}, "id": "call-1", "type": "tool_call"})
 
 
-def test_result_without_structured_content_has_no_artifact() -> None:
+def test_result_without_structured_content_or_meta_has_no_artifact() -> None:
     content, artifact = _convert_call_tool_result(
         CallToolResult(
             content=[TextContent(type="text", text="hello")],
@@ -141,6 +143,103 @@ def test_result_without_structured_content_has_no_artifact() -> None:
 
     assert [block["text"] for block in content if block["type"] == "text"] == ["hello"]
     assert artifact is None
+
+
+def test_convert_with_result_meta() -> None:
+    """A result-level `_meta` object is returned in MCPToolArtifact."""
+    content, artifact = _convert_call_tool_result(
+        CallToolResult(
+            content=[TextContent(type="text", text="hello")],
+            structured_content=None,
+            meta={"trace_id": "abc-123"},
+        )
+    )
+
+    assert [block["text"] for block in content if block["type"] == "text"] == ["hello"]
+    assert artifact == {"meta": {"trace_id": "abc-123"}}
+
+
+def test_convert_with_structured_content_and_meta() -> None:
+    """Both `structured_content` and `meta` survive conversion together."""
+    content, artifact = _convert_call_tool_result(
+        CallToolResult(
+            content=[],
+            structured_content={"result": 42},
+            meta={"cost_usd": 0.002},
+        )
+    )
+
+    assert content == []
+    assert artifact == {
+        "structured_content": {"result": 42},
+        "meta": {"cost_usd": 0.002},
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_success_returns_result_meta_through_ainvoke(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Result-level `_meta` reaches `ToolMessage.artifact` on the success path."""
+    server: FastMCP[None] = FastMCP("meta_server")
+
+    @server.tool
+    def ping() -> str:
+        """Return a response."""
+        return "pong"
+
+    tool, client = await _one_tool(server)
+    mock_result = CallToolResult(
+        content=[TextContent(type="text", text="pong")],
+        structured_content=None,
+        meta={"execution_ms": 45},
+    )
+    monkeypatch.setattr(client, "call_tool", AsyncMock(return_value=mock_result))
+
+    message = await tool.ainvoke({"name": "ping", "args": {}, "id": "call-1", "type": "tool_call"})
+
+    assert message.status == "success"
+    assert message.artifact == {"meta": {"execution_ms": 45}}
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_static_meta_and_result_meta_are_distinct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Static tool definition `_meta` and per-call result `_meta` remain separate."""
+    server: FastMCP[None] = FastMCP("meta_distinct")
+
+    @server.tool
+    def lookup() -> str:
+        """Lookup info."""
+        return "ok"
+
+    client: Client[Any] = Client(server)
+    async with client:
+        [mcp_tool] = await client.list_tools()
+        mcp_tool.meta = {"static_def": "v1"}
+        tool = await as_langchain_tool(mcp_tool, client)
+
+    # Static tool definition metadata lives on the tool itself
+    assert tool.metadata is not None
+    assert tool.metadata["mcp"]["tool"]["_meta"] == {"static_def": "v1"}
+
+    mock_result = CallToolResult(
+        content=[TextContent(type="text", text="ok")],
+        structured_content={"found": True},
+        meta={"call_trace": "xyz-789"},
+    )
+    monkeypatch.setattr(client, "call_tool", AsyncMock(return_value=mock_result))
+
+    # Call result metadata lives in the message artifact
+    message = await tool.ainvoke(
+        {"name": "lookup", "args": {}, "id": "call-2", "type": "tool_call"}
+    )
+    assert message.status == "success"
+    assert message.artifact == {
+        "structured_content": {"found": True},
+        "meta": {"call_trace": "xyz-789"},
+    }
 
 
 @pytest.mark.asyncio
